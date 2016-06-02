@@ -77,6 +77,27 @@ protected:
         Owned<authentication::Authenticator>(authenticator.get())));
   }
 
+  void performUTF8ReadTest(
+      Files& files,
+      process::UPID& upid,
+      const string& testFileName,
+      const string& a,
+      const string& b,
+      JSON::Object expected) {
+    ASSERT_SOME(os::write(testFileName, a + b));
+
+    AWAIT_EXPECT_READY(files.attach(testFileName, testFileName));
+
+    Future<Response> response =
+        process::http::get(
+            upid,
+            "read",
+            "path=" + testFileName + "&stripInvalidUTF8&offset=0");
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+  }
+
   virtual void TearDown()
   {
     foreach (const string& realm, realms) {
@@ -252,6 +273,233 @@ TEST_F(FilesTest, ResolveTest)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       BadRequest().status,
       process::http::get(upid, "read", "path=two/../two"));
+}
+
+
+TEST_F(FilesTest, StripBadUTF8Test)
+{
+  Files files;
+  process::UPID upid("files", process::address());
+
+  // valid ASCII "Hi I'm valid ASCII"
+  string validString = string({
+    (char)0b01001000, (char)0b01101001, (char)0b00100000, (char)0b01001001,
+    (char)0b00100111, (char)0b01101101, (char)0b00100000, (char)0b01110110,
+    (char)0b01100001, (char)0b01101100, (char)0b01101001, (char)0b01100100,
+    (char)0b00100000, (char)0b01000001, (char)0b01010011, (char)0b01000011,
+    (char)0b01001001, (char)0b01001001});
+
+  // valid UTF-8 (checkmarks and ASCII)
+  string validUTF8 = string({
+    (char)0b11100010, (char)0b10011100, (char)0b10010011, (char)0b01001000,
+    (char)0b01101001, (char)0b00100000, (char)0b01001001, (char)0b00100111,
+    (char)0b01101101, (char)0b00100000, (char)0b11100010, (char)0b10011100,
+    (char)0b10010011, (char)0b01110110, (char)0b01100001, (char)0b01101100,
+    (char)0b01101001, (char)0b01100100, (char)0b11100010, (char)0b10011100,
+    (char)0b10010011, (char)0b00100000, (char)0b01010101, (char)0b01010100,
+    (char)0b01000110, (char)0b00101101, (char)0b00111000, (char)0b00100000,
+    (char)0b11100010, (char)0b10011100, (char)0b10010011});
+
+  // invalid cent [2-byte] character - 1 byte(s) cut from beginning
+  string invalidBeginningCent = string({(char)0b10100010});
+  // invalid check [3-byte] character - 1 byte(s) cut from beginning
+  string invalidBeginningCheck = string({(char)0b10011100, (char)0b10010011});
+  // invalid pillow [4-byte] character - 1 byte(s) cut from beginning
+  string invalidBeginningPillow = string({(char)0b10100000, (char)0b10110001,
+    (char)0b10111000});
+  // invalid cent [2-byte] character - 1 byte(s) cut from end
+  string invalidEndCent1 = string({(char)0b11000010});
+  // invalid check [3-byte] character - 1 byte(s) cut from end
+  string invalidEndCheck1 = string({(char)0b11100010, (char)0b10011100});
+  // invalid pillow [4-byte] character - 1 byte(s) cut from end
+  string invalidEndPillow1 = string({(char)0b11110000, (char)0b10100000,
+    (char)0b10110001});
+  // invalid check [3-byte] character - 2 byte(s) cut from end
+  string invalidEndCheck2 = string({(char)0b11100010});
+  // invalid pillow [4-byte] character - 2 byte(s) cut from end
+  string invalidEndPillow2 = string({(char)0b11110000, (char)0b10100000});
+  // invalid pillow [4-byte] character - 3 byte(s) cut from end
+  string invalidEndPillow3 = string({(char)0b11110000});
+
+  string validCent = string({(char)0b11000010, (char)0b10100010});
+  string validCheck = string({(char)0b11100010, (char)0b10011100,
+    (char)0b10010011});
+  string validPillow = string({(char)0b11110000, (char)0b10100000,
+    (char)0b10110001, (char)0b10111000});
+
+  // Test just ASCII, no changes expected
+  JSON::Object expected;
+  expected.values["offset"] = 0;
+  expected.values["length"] = validString.length();
+  expected.values["data"] = validString;
+
+  performUTF8ReadTest(files, upid, "testValidString",
+                      validString, "",
+                      expected);
+
+  // Expect the invalid beginning to be chopped
+  expected.values["offset"] = 1;
+  expected.values["length"] = validString.length();
+  expected.values["data"] = validString;
+
+  performUTF8ReadTest(files, upid, "stripInvalidBeginningBytes1",
+                      invalidBeginningCent, validString,
+                      expected);
+
+  expected.values["offset"] = 2;
+  performUTF8ReadTest(files, upid, "stripInvalidBeginningBytes2",
+                      invalidBeginningCheck, validString,
+                      expected);
+
+  expected.values["offset"] = 3;
+  performUTF8ReadTest(files, upid, "stripInvalidBeginningBytes3",
+                      invalidBeginningPillow, validString,
+                      expected);
+
+  // Strip invalid end bytes
+  expected.values["offset"] = 0;
+  performUTF8ReadTest(files, upid, "stripInvalidEndBytesCent1",
+                      validString, invalidEndCent1,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "stripInvalidEndBytesCheck1",
+                      validString, invalidEndCheck1,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "stripInvalidEndBytesPillow1",
+                      validString, invalidEndPillow1,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "stripInvalidEndBytesCheck2",
+                      validString, invalidEndCheck2,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "stripInvalidEndBytesPillow2",
+                      validString, invalidEndPillow2,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "stripInvalidEndBytesPillow3",
+                      validString, invalidEndPillow3,
+                      expected);
+
+  // Test the ability to leave valid strings alone
+  expected.values["offset"] = 0;
+  expected.values["length"] = validString.length();
+  expected.values["data"] = validString;
+  performUTF8ReadTest(files, upid, "dontStripValidStringsASCII",
+                      validString, "",
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validUTF8.length();
+  expected.values["data"] = validUTF8;
+  performUTF8ReadTest(files, upid, "dontStripValidStringsUTF8",
+                      validUTF8, "",
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validUTF8.length() + validString.length();
+  expected.values["data"] = validUTF8 + validString;
+  performUTF8ReadTest(files, upid, "dontStripValidStringsBoth1",
+                      validUTF8, validString,
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validString.length() + validUTF8.length();
+  expected.values["data"] = validString + validUTF8;
+  performUTF8ReadTest(files, upid, "dontStripValidStringsBoth2",
+                      validString, validUTF8,
+                      expected);
+
+  // Small invalid strings tests
+  expected.values["offset"] = 0;
+  expected.values["length"] = 0;
+  expected.values["data"] = "";
+
+  // Invalid at beginning
+  expected.values["offset"] = 1;
+  performUTF8ReadTest(files, upid, "smallStringInvalidBeginning1",
+                      invalidBeginningCent, "",
+                      expected);
+
+  expected.values["offset"] = 2;
+  performUTF8ReadTest(files, upid, "smallStringInvalidBeginning2",
+                      invalidBeginningCheck, "",
+                      expected);
+
+  expected.values["offset"] = 3;
+  performUTF8ReadTest(files, upid, "smallStringInvalidBeginning3",
+                      invalidBeginningPillow, "",
+                      expected);
+
+  // Invalid at end
+  expected.values["offset"] = 0;
+  performUTF8ReadTest(files, upid, "smallStringInvalidEnd1",
+                      "", invalidEndCent1,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "smallStringInvalidEnd2",
+                      "", invalidEndCheck1,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "smallStringInvalidEnd3",
+                      "", invalidEndPillow1,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "smallStringInvalidEnd4",
+                      "", invalidEndCheck2,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "smallStringInvalidEnd5",
+                      "", invalidEndPillow2,
+                      expected);
+
+  performUTF8ReadTest(files, upid, "smallStringInvalidEnd6",
+                      "", invalidEndPillow3,
+                      expected);
+
+  // Valid UTF8 characters of all sizes at beginning and end of strings
+  expected.values["offset"] = 0;
+  expected.values["length"] = validCent.length() + validString.length();
+  expected.values["data"] = validCent + validString;
+  performUTF8ReadTest(files, upid, "validUTF8CharactersAtBeginning1",
+                      validCent, validString,
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validCheck.length() + validString.length();
+  expected.values["data"] = validCheck + validString;
+  performUTF8ReadTest(files, upid, "validUTF8CharactersAtBeginning2",
+                      validCheck, validString,
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validPillow.length() + validString.length();
+  expected.values["data"] = validPillow + validString;
+  performUTF8ReadTest(files, upid, "validUTF8CharactersAtBeginning3",
+                      validPillow, validString,
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validString.length() + validCent.length();
+  expected.values["data"] = validString + validCent;
+  performUTF8ReadTest(files, upid, "validUTF8CharactersAtEnd1",
+                      validString, validCent,
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validString.length() + validCheck.length();
+  expected.values["data"] = validString + validCheck;
+  performUTF8ReadTest(files, upid, "validUTF8CharactersAtEnd2",
+                      validString, validCheck,
+                      expected);
+
+  expected.values["offset"] = 0;
+  expected.values["length"] = validString.length() + validPillow.length();
+  expected.values["data"] = validString + validPillow;
+  performUTF8ReadTest(files, upid, "validUTF8CharactersAtEnd3",
+                      validString, validPillow,
+                      expected);
 }
 
 

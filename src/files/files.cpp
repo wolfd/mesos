@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include <boost/mpl/numeric_cast.hpp>
 #include <boost/shared_array.hpp>
 
 #include <process/deferred.hpp> // TODO(benh): This is required by Clang.
@@ -55,6 +56,8 @@
 #include "logging/logging.hpp"
 
 using namespace process;
+
+using boost::numeric_cast;
 
 using process::AUTHENTICATION;
 using process::DESCRIPTION;
@@ -307,16 +310,98 @@ Future<Response> FilesProcess::browse(
   return OK(listing, request.url.query.get("jsonp"));
 }
 
+bool _isContinuationByte(char b)
+{
+  // Bit-pattern check for UTF-8 continuation byte:
+  // 0b10xxxxxx -> true
+  return b >= (char)0b10000000 && b <= (char)0b10111111;
+}
+
+size_t _numberOfFollowingBytes(char b) {
+  // Bit-pattern check for UTF-8 character extra-byte length:
+  // 0b110xxxxx -> 1
+  // 0b1110xxxx -> 2
+  // 0b11110xxx -> 3
+  // else       -> 0
+  if (b >= (char)0b11000000 && b <= (char)0b11011111) {
+    return 1;
+  } else if (b >= (char)0b11100000 && b <= (char)0b11101111) {
+    return 2;
+  } else if (b >= (char)0b11110000 && b <= (char)0b11110111) {
+    return 3;
+  } else {
+    // this could be an ASCII char or a continuation byte
+    return 0;
+  }
+}
+
+JSON::Object _stripInvalidUTF8(const size_t& size,
+                               const off_t offset,
+                               const boost::shared_array<char>& data)
+{
+  size_t stripOffset = 0;
+  size_t stripLimit = size;
+
+  // Check to see if there's invalid UTF-8 at the beginning of the chunk
+  // a continuation byte (0b10xxxxxx) can never be at the start of a
+  // character find every continuation byte in a row at the beginning of the
+  // sequence and drop them.
+  for (int i = 0; i < 3 && i < size; i++) {
+    // remove every byte from the sequence that starts like 0b10...
+    if (_isContinuationByte(data[i])) {
+      stripOffset += 1;
+    } else {
+      break;
+    }
+  }
+
+  const int int_size = numeric_cast<int>(size);
+
+  // Check to see if there's invalid UTF-8 at the end of the chunk
+  for (int i = int_size - 3; i < int_size; i++) {
+    if (i < 0) {
+      // We don't want to prematurely end loop if string byte length < 3
+      // and i < 0 in this loop (but later i >= 0)
+      continue;
+    }
+
+    // Find number of continuation chars, if it extends the length of the
+    // array, move end offset back to before this byte and stop
+    const size_t following = _numberOfFollowingBytes(data[i]);
+    if (numeric_cast<size_t>(i) + following >= size) {
+      stripLimit = numeric_cast<size_t>(i);
+      break;
+    }
+  }
+
+
+  JSON::Object object;
+
+  const size_t newLength = stripLimit - stripOffset;
+
+  object.values["offset"] = offset + stripOffset;
+  object.values["length"] = newLength;
+  object.values["data"] = string(data.get(), stripOffset, newLength);
+
+  return object;
+}
+
 
 // TODO(benh): Remove 'const &' from size after fixing libprocess.
 Future<Response> _read(int fd,
                        const size_t& size,
                        off_t offset,
                        const boost::shared_array<char>& data,
-                       const Option<string>& jsonp) {
+                       const Option<string>& jsonp,
+                       bool stripInvalidUTF8) {
+  if (stripInvalidUTF8) {
+    return OK(_stripInvalidUTF8(size, offset, data), jsonp);
+  }
+
   JSON::Object object;
 
   object.values["offset"] = offset;
+  object.values["length"] = size;
   object.values["data"] = string(data.get(), size);
 
   return OK(object, jsonp);
@@ -429,6 +514,7 @@ Future<Response> FilesProcess::read(
 
     JSON::Object object;
     object.values["offset"] = size;
+    object.values["length"] = 0;
     object.values["data"] = "";
     return OK(object, request.url.query.get("jsonp"));
   }
@@ -464,7 +550,8 @@ Future<Response> FilesProcess::read(
         lambda::_1,
         offset,
         data,
-        request.url.query.get("jsonp")))
+        request.url.query.get("jsonp"),
+        request.url.query.contains("stripInvalidUTF8")))
     .onAny(lambda::bind(&os::close, fd.get()));
 }
 
